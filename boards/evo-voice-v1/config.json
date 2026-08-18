@@ -1,0 +1,11 @@
+{
+    "manufacturer": "evagent",
+    "type": "evo-voice-v1",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "evo-voice-v1",
+            "sdkconfig_append": []
+        }
+    ]
+}
