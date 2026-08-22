@@ -1,0 +1,11 @@
+# Build
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+# IDE
+.vscode/
+.idea/
+# Local
+*.local.h
+*_private.h
