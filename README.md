@@ -112,6 +112,9 @@ ESP32-S3 N16R8（8MB OCT PSRAM）+ 两个纯 I2S 外设，无 I2C codec 芯片�
 
 ## 使用方式
 
+> 分层入口：**[0 层 · 先看效果](https://github.com/Linnnnnn666/evo-fall-mcp)**（系统架构图）· **[1 层 · 纯软件 5 分钟](https://github.com/Linnnnnn666/evo-fall-mcp#快速开始)**（能力中枢，无需硬件）·
+> **[2 层 · 单板体验](https://github.com/Linnnnnn666/evo-firmware)**（跌倒板/业务板）· **[3 层 · 完整系统](https://github.com/Linnnnnn666/evo-fall-mcp/blob/main/docs/QUICK_START.md)**（本板全链路搭建）
+
 ```bash
 git clone https://github.com/78/xiaozhi-esp32.git -b v2.4.2 xiaozhi
 cd xiaozhi
