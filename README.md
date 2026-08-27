@@ -148,6 +148,25 @@ idf.py -p COMx flash monitor
 5. **默认音量 30**：3.3V 供电的 MAX98357A 大音量会拉垮电源（见供电注意）。
 6. **唤醒词与服务器人设对齐**：esp-sr 自带 `wn9_nihaoxiaoan_tts2` 预训练模型，切换 sdkconfig 即可，无需训练。
 
+## 空闲保活（keep-alive）补丁
+
+上游 v2.4.2 的 WebSocket 是**懒连接**——只有对话时才连服务器，说完即断。板子空闲时服务器找不到它，`/api/push` 会返回 `404 no active device`，闹钟/主动播报在空闲时全部失效。
+
+`docs/patches/websocket-keepalive.patch` 让固件**开机即连、每 30s 心跳、断线自动重连**，空闲时也能被服务器随时喊话（本系统已用于 23:30 闹钟补播闭环验证）：
+
+```bash
+git apply docs/patches/websocket-keepalive.patch   # 在 xiaozhi 仓库根目录执行
+```
+
+配套服务器配置（`data/.config.yaml`，重启生效）：
+
+```yaml
+enable_websocket_ping: true             # 默认 false！不开启则服务器直接忽略心跳
+close_connection_no_voice_time: 86400   # 空闲超时 600→86400（双保险）
+```
+
+实现要点：心跳用 JSON `{"type":"ping"}`（服务器回 `pong` 并刷新活动时间戳），而不是 WS 控制帧 Ping——后者不会更新服务器的 `last_activity_time`；连接对象改 `shared_ptr` + 互斥锁，避免后台心跳与关闭连接的任务竞态。
+
 ## 服务器集成
 
 - WS 连接：`ws://YOUR_SERVER/xiaozhi/v1/`（Caddy 反代到 xiaozhi-server 8001）
@@ -159,6 +178,7 @@ idf.py -p COMx flash monitor
 - `feat(board)` 板卡骨架：引脚定义与注册配置（08-18）
 - `feat(audio)` I2S 音频 codec：16-bit 槽位 + 显式通道 enable + 输入增益 ×16 + mono→stereo 播放修复（08-20）
 - `docs` README：接线/构建/踩坑记录/服务器集成（08-25）
+- `feat(keepalive)` WebSocket 空闲保活：开机即连 + 30s JSON 心跳 + 断线自动重连，空闲可被服务器主动喊话（08-28）
 
 ## License
 

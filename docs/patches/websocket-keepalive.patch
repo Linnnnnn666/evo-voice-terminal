@@ -1,0 +1,447 @@
+﻿diff --git a/main/protocols/websocket_protocol.cc b/main/protocols/websocket_protocol.cc
+index 9586c6d..190f0be 100644
+--- a/main/protocols/websocket_protocol.cc
++++ b/main/protocols/websocket_protocol.cc
+@@ -14,71 +14,116 @@
+ 
+ WebsocketProtocol::WebsocketProtocol() { event_group_handle_ = xEventGroupCreate(); }
+ 
+-WebsocketProtocol::~WebsocketProtocol() { vEventGroupDelete(event_group_handle_); }
+-
+-bool WebsocketProtocol::Start() {
+-    // Only connect to server when audio channel is needed
+-    return true;
+-}
+-
+-bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
+-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+-        return false;
++WebsocketProtocol::~WebsocketProtocol() {
++    // Detach the live connection first (no channel-closed callback: the
++    // protocol object is going away).
++    std::shared_ptr<WebSocket> old;
++    {
++        std::lock_guard<std::mutex> lock(websocket_mutex_);
++        old = std::move(websocket_);
++        hello_received_ = false;
+     }
++    old.reset();  // may block in the Tcp destructor; lock not held
+ 
+-    if (version_ == 2) {
+-        std::string serialized;
+-        serialized.resize(sizeof(BinaryProtocol2) + packet->payload.size());
+-        auto bp2 = (BinaryProtocol2*)serialized.data();
+-        bp2->version = htons(version_);
+-        bp2->type = 0;
+-        bp2->reserved = 0;
+-        bp2->timestamp = htonl(packet->timestamp);
+-        bp2->payload_size = htonl(packet->payload.size());
+-        memcpy(bp2->payload, packet->payload.data(), packet->payload.size());
+-
+-        return websocket_->Send(serialized.data(), serialized.size(), true);
+-    } else if (version_ == 3) {
+-        std::string serialized;
+-        serialized.resize(sizeof(BinaryProtocol3) + packet->payload.size());
+-        auto bp3 = (BinaryProtocol3*)serialized.data();
+-        bp3->type = 0;
+-        bp3->reserved = 0;
+-        bp3->payload_size = htons(packet->payload.size());
+-        memcpy(bp3->payload, packet->payload.data(), packet->payload.size());
+-
+-        return websocket_->Send(serialized.data(), serialized.size(), true);
++    // Stop the keep-alive task and wait for it to exit before freeing the
++    // event group it uses. A connect attempt can block for up to ~20s, so
++    // wait a bit longer; if it still hasn't exited, leak the event group
++    // rather than risk the task tripping on freed memory.
++    if (keep_alive_running_.exchange(false)) {
++        EventBits_t bits = xEventGroupWaitBits(event_group_handle_,
++                                               WEBSOCKET_PROTOCOL_KEEP_ALIVE_EXIT_EVENT, pdFALSE,
++                                               pdFALSE, pdMS_TO_TICKS(25000));
++        if (bits & WEBSOCKET_PROTOCOL_KEEP_ALIVE_EXIT_EVENT) {
++            vEventGroupDelete(event_group_handle_);
++        } else {
++            ESP_LOGW(TAG, "Keep-alive task did not exit in time; leaking event group");
++        }
+     } else {
+-        return websocket_->Send(packet->payload.data(), packet->payload.size(), true);
++        vEventGroupDelete(event_group_handle_);
+     }
+ }
+ 
+-bool WebsocketProtocol::SendText(const std::string& text) {
+-    if (websocket_ == nullptr || !websocket_->IsConnected()) {
+-        return false;
++bool WebsocketProtocol::Start() {
++    // EvoAgent keep-alive: hold an idle WebSocket connection to the server so
++    // that server-initiated pushes (alarms, notifications) can reach the
++    // device while no audio channel is open. Upstream v2.4.2 connects lazily,
++    // which made the server report "no active device" for an idle board.
++    if (keep_alive_running_.exchange(true)) {
++        return true;
+     }
+-
+-    if (!websocket_->Send(text)) {
+-        ESP_LOGE(TAG, "Failed to send text: %s", text.c_str());
+-        SetError(Lang::Strings::SERVER_ERROR);
++    if (xTaskCreate([](void* arg) { static_cast<WebsocketProtocol*>(arg)->KeepAliveTask(); },
++                    "ws_keepalive", kKeepAliveTaskStackSize, this, 5, nullptr) != pdPASS) {
++        keep_alive_running_ = false;
++        ESP_LOGE(TAG, "Failed to create keep-alive task");
+         return false;
+     }
+-
+     return true;
+ }
+ 
+-bool WebsocketProtocol::IsAudioChannelOpened() const {
+-    return websocket_ != nullptr && websocket_->IsConnected() && !error_occurred_ && !IsTimeout();
+-}
++void WebsocketProtocol::KeepAliveTask() {
++    ESP_LOGI(TAG, "Keep-alive task started");
++    TickType_t wait = pdMS_TO_TICKS(2000);  // first attempt shortly after boot
++    while (keep_alive_running_.load()) {
++        // Sleep in 1s slices so the task can exit promptly on shutdown.
++        while (wait > 0 && keep_alive_running_.load()) {
++            TickType_t slice = (wait > pdMS_TO_TICKS(1000)) ? pdMS_TO_TICKS(1000) : wait;
++            vTaskDelay(slice);
++            wait -= slice;
++        }
++        if (!keep_alive_running_.load()) {
++            break;
++        }
++        wait = pdMS_TO_TICKS(kKeepAliveReconnectDelayMs);
+ 
+-void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
+-    (void)send_goodbye;  // Websocket doesn't need to send goodbye message
+-    websocket_.reset();
++        std::shared_ptr<WebSocket> ws;
++        {
++            std::lock_guard<std::mutex> lock(websocket_mutex_);
++            ws = websocket_;
++        }
++        if (ws != nullptr && ws->IsConnected()) {
++            // The server refreshes its activity timestamp when it receives
++            // {"type":"ping"} and replies {"type":"pong"}, so both sides of
++            // the idle connection stay fresh.
++            if (ws->Send("{\"type\":\"ping\"}")) {
++                wait = pdMS_TO_TICKS(kKeepAlivePingIntervalMs);
++                continue;
++            }
++            // Half-dead connection: drop it and reconnect.
++            ESP_LOGW(TAG, "Keep-alive ping failed, forcing reconnect");
++            std::shared_ptr<WebSocket> old;
++            {
++                std::lock_guard<std::mutex> lock(websocket_mutex_);
++                if (websocket_ == ws) {
++                    old = std::move(websocket_);
++                    hello_received_ = false;
++                }
++            }
++            old.reset();  // may block in the Tcp destructor; lock not held
++            if (on_audio_channel_closed_ != nullptr) {
++                on_audio_channel_closed_();
++            }
++            continue;
++        }
++
++        // Not connected: try to (re)connect quietly. Only one connector may
++        // run at a time; skip this round if someone else (e.g. the app
++        // opening the audio channel) is already connecting.
++        if (connecting_.exchange(true)) {
++            continue;
++        }
++        if (ConnectAndHandshake(false) && on_audio_channel_opened_ != nullptr) {
++            on_audio_channel_opened_();
++        }
++        connecting_ = false;
++    }
++    xEventGroupSetBits(event_group_handle_, WEBSOCKET_PROTOCOL_KEEP_ALIVE_EXIT_EVENT);
++    vTaskDelete(NULL);
+ }
+ 
+-bool WebsocketProtocol::OpenAudioChannel() {
++bool WebsocketProtocol::ConnectAndHandshake(bool notify_errors) {
+     Settings settings("websocket", false);
+-    std::string url = settings.GetString("url");
++    // EvoAgent 默认服务器地址（settings 优先；私有部署，开源版替换为 YOUR_SERVER_HOST）
++    std::string url = settings.GetString("url", "ws://8.138.37.167/xiaozhi/v1/");
+     std::string token = settings.GetString("token");
+     int version = settings.GetInt("version");
+     if (version != 0) {
+@@ -88,9 +133,12 @@ bool WebsocketProtocol::OpenAudioChannel() {
+     error_occurred_ = false;
+ 
+     auto network = Board::GetInstance().GetNetwork();
+-    websocket_ = network->CreateWebSocket(1);
+-    if (websocket_ == nullptr) {
++    auto ws = std::shared_ptr<WebSocket>(network->CreateWebSocket(1));
++    if (ws == nullptr) {
+         ESP_LOGE(TAG, "Failed to create websocket");
++        if (notify_errors) {
++            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
++        }
+         return false;
+     }
+ 
+@@ -99,13 +147,13 @@ bool WebsocketProtocol::OpenAudioChannel() {
+         if (token.find(" ") == std::string::npos) {
+             token = "Bearer " + token;
+         }
+-        websocket_->SetHeader("Authorization", token.c_str());
++        ws->SetHeader("Authorization", token.c_str());
+     }
+-    websocket_->SetHeader("Protocol-Version", std::to_string(version_).c_str());
+-    websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+-    websocket_->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
++    ws->SetHeader("Protocol-Version", std::to_string(version_).c_str());
++    ws->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
++    ws->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
+ 
+-    websocket_->OnData([this](const char* data, size_t len, bool binary) {
++    ws->OnData([this](const char* data, size_t len, bool binary) {
+         if (binary) {
+             if (on_incoming_audio_ != nullptr) {
+                 if (version_ == 2) {
+@@ -145,6 +193,8 @@ bool WebsocketProtocol::OpenAudioChannel() {
+             if (cJSON_IsString(type)) {
+                 if (strcmp(type->valuestring, "hello") == 0) {
+                     ParseServerHello(root);
++                } else if (strcmp(type->valuestring, "pong") == 0) {
++                    // Keep-alive heartbeat reply; nothing to do.
+                 } else {
+                     if (on_incoming_json_ != nullptr) {
+                         on_incoming_json_(root);
+@@ -158,23 +208,40 @@ bool WebsocketProtocol::OpenAudioChannel() {
+         last_incoming_time_ = std::chrono::steady_clock::now();
+     });
+ 
+-    websocket_->OnDisconnected([this]() {
++    // Only notify the app when the *current* connection drops. Stale
++    // connections (replaced by a reconnect, or detached by CloseAudioChannel)
++    // must not fire spurious channel-closed callbacks.
++    WebSocket* ws_raw = ws.get();
++    ws->OnDisconnected([this, ws_raw]() {
+         ESP_LOGI(TAG, "Websocket disconnected");
+-        if (on_audio_channel_closed_ != nullptr) {
++        bool is_current = false;
++        {
++            std::lock_guard<std::mutex> lock(websocket_mutex_);
++            is_current = (websocket_ != nullptr && websocket_.get() == ws_raw);
++            if (is_current) {
++                hello_received_ = false;
++            }
++        }
++        if (is_current && on_audio_channel_closed_ != nullptr) {
+             on_audio_channel_closed_();
+         }
+     });
+ 
+     ESP_LOGI(TAG, "Connecting to websocket server: %s with version: %d", url.c_str(), version_);
+-    if (!websocket_->Connect(url.c_str())) {
+-        ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", websocket_->GetLastError());
+-        SetError(Lang::Strings::SERVER_NOT_CONNECTED);
++    if (!ws->Connect(url.c_str())) {
++        ESP_LOGE(TAG, "Failed to connect to websocket server, code=%d", ws->GetLastError());
++        if (notify_errors) {
++            SetError(Lang::Strings::SERVER_NOT_CONNECTED);
++        }
+         return false;
+     }
+ 
+     // Send hello message to describe the client
+     auto message = GetHelloMessage();
+-    if (!SendText(message)) {
++    if (!ws->Send(message)) {
++        if (notify_errors) {
++            SetError(Lang::Strings::SERVER_ERROR);
++        }
+         return false;
+     }
+ 
+@@ -184,17 +251,136 @@ bool WebsocketProtocol::OpenAudioChannel() {
+                             pdFALSE, pdMS_TO_TICKS(10000));
+     if (!(bits & WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT)) {
+         ESP_LOGE(TAG, "Failed to receive server hello");
+-        SetError(Lang::Strings::SERVER_TIMEOUT);
++        if (notify_errors) {
++            SetError(Lang::Strings::SERVER_TIMEOUT);
++        }
++        return false;
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(websocket_mutex_);
++        websocket_ = ws;
++        hello_received_ = true;
++    }
++    return true;
++}
++
++bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
++    std::shared_ptr<WebSocket> ws;
++    {
++        std::lock_guard<std::mutex> lock(websocket_mutex_);
++        ws = websocket_;
++    }
++    if (ws == nullptr || !ws->IsConnected()) {
+         return false;
+     }
+ 
+-    if (on_audio_channel_opened_ != nullptr) {
+-        on_audio_channel_opened_();
++    if (version_ == 2) {
++        std::string serialized;
++        serialized.resize(sizeof(BinaryProtocol2) + packet->payload.size());
++        auto bp2 = (BinaryProtocol2*)serialized.data();
++        bp2->version = htons(version_);
++        bp2->type = 0;
++        bp2->reserved = 0;
++        bp2->timestamp = htonl(packet->timestamp);
++        bp2->payload_size = htonl(packet->payload.size());
++        memcpy(bp2->payload, packet->payload.data(), packet->payload.size());
++
++        return ws->Send(serialized.data(), serialized.size(), true);
++    } else if (version_ == 3) {
++        std::string serialized;
++        serialized.resize(sizeof(BinaryProtocol3) + packet->payload.size());
++        auto bp3 = (BinaryProtocol3*)serialized.data();
++        bp3->type = 0;
++        bp3->reserved = 0;
++        bp3->payload_size = htons(packet->payload.size());
++        memcpy(bp3->payload, packet->payload.data(), packet->payload.size());
++
++        return ws->Send(serialized.data(), serialized.size(), true);
++    } else {
++        return ws->Send(packet->payload.data(), packet->payload.size(), true);
++    }
++}
++
++bool WebsocketProtocol::SendText(const std::string& text) {
++    std::shared_ptr<WebSocket> ws;
++    {
++        std::lock_guard<std::mutex> lock(websocket_mutex_);
++        ws = websocket_;
++    }
++    if (ws == nullptr || !ws->IsConnected()) {
++        return false;
++    }
++
++    if (!ws->Send(text)) {
++        ESP_LOGE(TAG, "Failed to send text: %s", text.c_str());
++        SetError(Lang::Strings::SERVER_ERROR);
++        return false;
+     }
+ 
+     return true;
+ }
+ 
++bool WebsocketProtocol::IsAudioChannelOpened() const {
++    std::lock_guard<std::mutex> lock(websocket_mutex_);
++    return websocket_ != nullptr && websocket_->IsConnected() && hello_received_ &&
++           !error_occurred_ && !IsTimeout();
++}
++
++bool WebsocketProtocol::OpenAudioChannel() {
++    // If the keep-alive connection is already live, it doubles as the audio
++    // channel: the server accepts audio on the established session.
++    if (IsAudioChannelOpened()) {
++        return true;
++    }
++
++    // Wait for an in-flight keep-alive connect attempt (if any) to settle.
++    if (connecting_.load()) {
++        int waited_ms = 0;
++        while (connecting_.load() && waited_ms < 12000) {
++            vTaskDelay(pdMS_TO_TICKS(100));
++            waited_ms += 100;
++        }
++        if (IsAudioChannelOpened()) {
++            return true;
++        }
++    }
++
++    // Try to connect ourselves; only one connector may run at a time.
++    if (!connecting_.exchange(true)) {
++        bool ok = ConnectAndHandshake(true);
++        if (ok && on_audio_channel_opened_ != nullptr) {
++            on_audio_channel_opened_();
++        }
++        connecting_ = false;
++        return ok;
++    }
++
++    // A keep-alive attempt started right after our check; wait once more.
++    int waited_ms = 0;
++    while (connecting_.load() && waited_ms < 12000) {
++        vTaskDelay(pdMS_TO_TICKS(100));
++        waited_ms += 100;
++    }
++    return IsAudioChannelOpened();
++}
++
++void WebsocketProtocol::CloseAudioChannel(bool send_goodbye) {
++    (void)send_goodbye;  // Websocket doesn't need to send goodbye message
++    std::shared_ptr<WebSocket> old;
++    {
++        std::lock_guard<std::mutex> lock(websocket_mutex_);
++        old = std::move(websocket_);
++        hello_received_ = false;
++    }
++    old.reset();  // may block in the Tcp destructor; lock not held
++    // The destructor no longer fires the callback for a detached connection,
++    // so fire it explicitly.
++    if (on_audio_channel_closed_ != nullptr) {
++        on_audio_channel_closed_();
++    }
++}
++
+ std::string WebsocketProtocol::GetHelloMessage() {
+     // keys: message type, version, audio_params (format, sample_rate, channels)
+     cJSON* root = cJSON_CreateObject();
+diff --git a/main/protocols/websocket_protocol.h b/main/protocols/websocket_protocol.h
+index 48bbc00..2a3fada 100644
+--- a/main/protocols/websocket_protocol.h
++++ b/main/protocols/websocket_protocol.h
+@@ -7,8 +7,12 @@
+ #include <web_socket.h>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/event_groups.h>
++#include <atomic>
++#include <mutex>
++#include <memory>
+ 
+ #define WEBSOCKET_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
++#define WEBSOCKET_PROTOCOL_KEEP_ALIVE_EXIT_EVENT (1 << 1)
+ 
+ class WebsocketProtocol : public Protocol {
+ public:
+@@ -23,12 +27,28 @@ public:
+ 
+ private:
+     EventGroupHandle_t event_group_handle_;
+-    std::unique_ptr<WebSocket> websocket_;
++    std::shared_ptr<WebSocket> websocket_;
+     int version_ = 1;
+ 
++    // EvoAgent keep-alive: hold an idle WebSocket connection to the server so
++    // server-initiated pushes (alarms / notifications) can reach the device
++    // while no audio channel is open, and reconnect automatically on drop.
++    // Upstream v2.4.2 connects lazily, which left the server seeing
++    // "no active device" while the board was idle.
++    std::atomic<bool> keep_alive_running_{false};
++    std::atomic<bool> connecting_{false};   // one connector at a time
++    bool hello_received_ = false;           // guarded by websocket_mutex_
++    mutable std::mutex websocket_mutex_;
++
+     void ParseServerHello(const cJSON* root);
+     bool SendText(const std::string& text) override;
+     std::string GetHelloMessage();
++    bool ConnectAndHandshake(bool notify_errors);
++    void KeepAliveTask();
++
++    static constexpr int kKeepAlivePingIntervalMs = 30000;
++    static constexpr int kKeepAliveReconnectDelayMs = 5000;
++    static constexpr int kKeepAliveTaskStackSize = 8192;
+ };
+ 
+ #endif
