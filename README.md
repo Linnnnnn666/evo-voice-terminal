@@ -2,6 +2,8 @@
 
 > **一句话**：用语音或文字指挥 AI 智能体，为 ESP32 板卡完成「写固件 → 编译 → OTA 部署 → 遥测验收 → 经验沉淀」的完整开发闭环——**核心链路已验证、架构完整、持续迭代中的系统原型**，双层自进化，人在环兜底。
 
+> **English abstract**: Custom board package (`evo-voice-v1`) for **xiaozhi-esp32 v2.4.2** on **ESP32-S3** — a clean bring-up with two bare I2S peripherals: an **INMP441** microphone and a **MAX98357A** amplifier (no I2C codec). Wake word "你好小安" via esp-sr, plus a WebSocket **keep-alive patch** that lets the server push TTS broadcasts (alarms/notifications) to an idle board. Includes pinout, build and debugging notes. MIT licensed. Part of the self-evolving EvoAgent system — see [evo-firmware](https://github.com/Linnnnnn666/evo-firmware) and [evo-fall-mcp](https://github.com/Linnnnnn666/evo-fall-mcp).
+
 ```
                               ┌──────────────┐
                               │     用户     │
