@@ -2,13 +2,13 @@
 
 > **一句话**：用语音或文字指挥 AI 智能体，为 ESP32 板卡完成「写固件 → 编译 → OTA 部署 → 遥测验收 → 经验沉淀」的完整开发闭环——**核心链路已验证、架构完整、持续迭代中的系统原型**，双层自进化，人在环兜底。
 
-> **English abstract**: Custom board package (`evo-voice-v1`) for **xiaozhi-esp32 v2.4.2** on **ESP32-S3** — a clean bring-up with two bare I2S peripherals: an **INMP441** microphone and a **MAX98357A** amplifier (no I2C codec). Wake word "你好小安" via esp-sr, plus a WebSocket **keep-alive patch** that lets the server push TTS broadcasts (alarms/notifications) to an idle board. Includes pinout, build and debugging notes. MIT licensed. Part of the self-evolving EvoAgent system — see [evo-firmware](https://github.com/Linnnnnn666/evo-firmware) and [evo-fall-mcp](https://github.com/Linnnnnn666/evo-fall-mcp).
+> **English abstract**: Custom board package (`evo-voice-v1`) for **xiaozhi-esp32 v2.4.2** on **ESP32-S3** — a clean bring-up with two bare I2S peripherals: an **INMP441** microphone and a **MAX98357A** amplifier (no I2C codec). Wake word "你好小智" via esp-sr, plus a WebSocket **keep-alive patch** that lets the server push TTS broadcasts (alarms/notifications) to an idle board. Includes pinout, build and debugging notes. MIT licensed. Part of the self-evolving EvoAgent system — see [evo-firmware](https://github.com/Linnnnnn666/evo-firmware) and [evo-fall-mcp](https://github.com/Linnnnnn666/evo-fall-mcp).
 
 ```
                               ┌──────────────┐
                               │     用户     │
                               └──────┬───────┘
-                语音「你好小安」        │       文字（DSH 会话）
+                语音「你好小智」        │       文字（DSH 会话）
                      │               │              │
                      ▼               ▼              ▼
         ┌──────────────────┐  ┌────────────────────────────┐
@@ -67,7 +67,7 @@ DSH-1 干活 → 复盘① 固化工具（手变强）/ 复盘② 发现缺口 �
 ```
 
 **进化的是能力容器（工具/插件/经验），不碰模型**——可控、可解释、可回滚。
-而你面前的这块语音板，就是这套系统的**人类入口**：喊一声「你好小安」，指挥整个自进化系统干活。
+而你面前的这块语音板，就是这套系统的**人类入口**：喊一声「你好小智」，指挥整个自进化系统干活。
 
 ## 两个支撑信念
 
@@ -80,13 +80,13 @@ DSH-1 干活 → 复盘① 固化工具（手变强）/ 复盘② 发现缺口 �
 |------|------|--------|
 | **[evo-firmware](https://github.com/Linnnnnn666/evo-firmware)** | 硬件端 | ESP32-S3 固件集合：跌倒检测板（端侧 AI）、云端烧录板、配置化引导固件 |
 | **[evo-fall-mcp](https://github.com/Linnnnnn666/evo-fall-mcp)** | 能力中枢 | MCP 服务器（47 工具）：部署/烧录/播报/自验收/自进化，连接 AI 与硬件 |
-| **[evo-voice-terminal](https://github.com/Linnnnnn666/evo-voice-terminal)** | 语音入口 | 语音板板卡包：唤醒「你好小安」→ 语音对话 → TTS 播报 |
+| **[evo-voice-terminal](https://github.com/Linnnnnn666/evo-voice-terminal)** | 语音入口 | 语音板板卡包：唤醒「你好小智」→ 语音对话 → TTS 播报 |
 
 **本仓库是其中的「语音入口」**——让用户用最自然的方式（说话）指挥整个系统。
 
 ---
 
-# EvoAgent Voice Terminal — 小安语音板（evo-voice-v1）
+# EvoAgent Voice Terminal — 小智语音板（evo-voice-v1）
 
 基于 [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) **v2.4.2** 的**板卡定制包**（board package），不是完整固件。
 
@@ -94,7 +94,7 @@ DSH-1 干活 → 复盘① 固化工具（手变强）/ 复盘② 发现缺口 �
 
 ## 它在系统中的角色
 
-- **入口**：用户喊「你好小安」，唤醒词在本地 esp-sr 完成（离线、低延迟）
+- **入口**：用户喊「你好小智」，唤醒词在本地 esp-sr 完成（离线、低延迟）
 - **对话**：WS/opus 上送服务器 → ASR(SherpaParaformer) → LLM(deepseek function_call) → TTS(Edge) → 板子播放
 - **播报**：系统主动开口（跌倒事件/部署结果）——fall-mcp `dev_speak` → `/api/push` → 板子 TTS 原样播报
 - **OTA**：固件升级走自家服务器 `/xiaozhi/ota/`，与部署闭环无缝衔接
@@ -136,7 +136,7 @@ idf.py -p COMx flash monitor
 | 配置 | 值 | 原因 |
 |------|-----|------|
 | `CONFIG_BOARD_TYPE_EVO_VOICE_V1=y` | 板卡 | 注册本板 |
-| `CONFIG_SR_WN_WN9_NIHAOXIAOAN_TTS2=y` | 唤醒词 | 「你好小安」（与服务器人设一致） |
+| `CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y` | 唤醒词 | 「你好小智」（与服务器人设一致） |
 | `CONFIG_SPIRAM_MODE_OCT=y` | PSRAM | 本板为 OCT 嵌入式 PSRAM（QUAD 会启动失败） |
 | `CONFIG_SPIRAM_SPEED_40M=y` | PSRAM 频率 | 40M 更稳定（80M 偶发随机崩溃） |
 | `CONFIG_OTA_URL="http://YOUR_SERVER/xiaozhi/ota/"` | OTA | 指向自家 xiaozhi-server（避开官方激活流程） |
